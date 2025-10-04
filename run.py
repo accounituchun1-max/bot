@@ -63,6 +63,7 @@ class ChannelStates(StatesGroup):
     waiting_for_promote_user = State()
     waiting_for_pin_message = State()
     waiting_for_chat_photo = State()
+    waiting_for_unpin_message = State()
 
 # ==================== LOG TIZIMI ====================
 
@@ -526,7 +527,7 @@ async def process_pin_message(message: Message, state: FSMContext):
     await state.clear()
 
 @dp.callback_query(F.data.startswith("unpin_"))
-async def unpin_message(callback: CallbackQuery):
+async def unpin_message_start(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split("_")[1])
     user_id = callback.from_user.id
     
@@ -534,14 +535,51 @@ async def unpin_message(callback: CallbackQuery):
         await callback.answer("❌ Topilmadi!", show_alert=True)
         return
     
+    # Ask for message ID to unpin
+    await state.update_data(channel_idx=idx, prompt_message_id=callback.message.message_id)
+    await state.set_state(ChannelStates.waiting_for_unpin_message)
+    await callback.message.edit_text("📍 <b>Unpin qilinadigan xabar ID'sini yuboring:</b>", parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(ChannelStates.waiting_for_unpin_message)
+async def process_unpin_message(message: Message, state: FSMContext):
+    data = await state.get_data()
+    idx = data.get("channel_idx")
+    user_id = message.from_user.id
+    
+    if user_id not in user_channels or idx is None or idx >= len(user_channels[user_id]):
+        await message.answer("❌ Topilmadi!")
+        await state.clear()
+        return
+    
     channel = user_channels[user_id][idx]
     try:
-        await bot.unpin_chat_message(chat_id=channel["id"])
-        write_log(user_id, callback.from_user.username, "UNPINNED", channel['name'])
-        await callback.message.edit_text(f"✅ <b>Unpin bajarildi!</b>\n\n📢 {channel['name']}", parse_mode="HTML", reply_markup=get_main_menu())
-        await callback.answer("✅")
+        message_id = int(message.text.strip())
+        await bot.unpin_chat_message(chat_id=channel["id"], message_id=message_id)
+        write_log(user_id, message.from_user.username, "UNPINNED", f"ID: {message_id}")
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            f"✅ <b>Unpin bajarildi!</b>\n\n📢 {channel['name']}",
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
+    except ValueError:
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            "❌ Faqat raqam yuboring!",
+            message_id=data.get("prompt_message_id")
+        )
     except Exception:
-        await callback.answer("❌ Xatolik", show_alert=True)
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            DEFAULT_ERROR_TEXT,
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
+    await state.clear()
 
 @dp.callback_query(F.data.startswith("unpinall_"))
 async def unpin_all_messages(callback: CallbackQuery):
