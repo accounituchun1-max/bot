@@ -13,6 +13,27 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 # ==================== KONFIGURATSIYA ====================
 
+# Load .env if present so Windows/locals work without manual env exports
+def _load_env_from_file(path: str = ".env") -> None:
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                os.environ.setdefault(key, value)
+    except Exception:
+        pass
+
+_load_env_from_file()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1029657375"))
 
@@ -625,8 +646,8 @@ async def get_chat_info(callback: CallbackQuery):
             "📊 <b>Ma'lumot:</b>\n\n"
             f"🆔 <code>{chat.id}</code>\n"
             f"📝 {chat.title}\n"
-            f"📖 {chat.description or 'Yo\`q'}\n"
-            f"👤 @{chat.username or 'Yo\`q'}"
+            f"📖 {chat.description or 'Yo`q'}\n"
+            f"👤 @{chat.username or 'Yo`q'}"
         )
         await callback.message.edit_text(info, parse_mode="HTML", reply_markup=get_info_menu(idx))
         await callback.answer("✅")
