@@ -3,6 +3,7 @@ import asyncio
 import json
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
+from typing import Optional
 from aiogram.filters import Command
 from aiogram.types import Message, FSInputFile, ChatPermissions, InputMediaPhoto, CallbackQuery
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -12,8 +13,11 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 # ==================== KONFIGURATSIYA ====================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7642298934:AAFWbvA0o0Ok78ud7HPpXrgSZjcraxmhSKY")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1029657375"))
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is required")
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
@@ -70,6 +74,7 @@ def write_log(user_id, username, action, details=""):
             f.write(log_entry)
     except:
         pass
+    # Send logs only to admin, never to end users
     asyncio.create_task(send_log_to_admin(user_id, username, action, details))
 
 async def send_log_to_admin(user_id, username, action, details):
@@ -78,6 +83,27 @@ async def send_log_to_admin(user_id, username, action, details):
         await bot.send_message(ADMIN_ID, log_msg, parse_mode="HTML")
     except:
         pass
+
+# ==================== UTILITIES ====================
+
+DEFAULT_ERROR_TEXT = "❌ Xatolik yuz berdi. Keyinroq urinib ko'ring."
+
+async def edit_or_send_message(chat_id: int, fallback_message: types.Message, text: str, *,
+                               message_id: Optional[int] = None,
+                               reply_markup: Optional[InlineKeyboardMarkup] = None,
+                               parse_mode: Optional[str] = "HTML"):
+    """
+    Try to edit an existing bot message. If not possible, send a new message.
+    """
+    try:
+        if message_id is not None:
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text,
+                                        reply_markup=reply_markup, parse_mode=parse_mode)
+            return
+    except Exception:
+        # Fallback to sending a new message below
+        pass
+    await fallback_message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
 
 # ==================== KEYBOARD FUNKSIYALARI ====================
 
@@ -174,7 +200,8 @@ async def start_handler(message: Message):
 
 @dp.callback_query(F.data == "add_channel")
 async def add_channel_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer(
+    await state.update_data(prompt_message_id=callback.message.message_id)
+    await callback.message.edit_text(
         "📝 <b>Kanal ID'sini yuboring:</b>\n\n"
         "• <code>-1001234567890</code>\n"
         "• <code>@username</code>\n\n"
@@ -191,7 +218,14 @@ async def process_channel_id(message: Message, state: FSMContext):
         chat = await bot.get_chat(chat_id=channel_id)
         bot_member = await bot.get_chat_member(chat_id=chat.id, user_id=bot.id)
         if bot_member.status not in ["administrator", "creator"]:
-            await message.answer("❌ Bot admin emas!")
+            data = await state.get_data()
+            await edit_or_send_message(
+                message.chat.id,
+                message,
+                "❌ Bot kanal/guruhda admin emas!",
+                message_id=data.get("prompt_message_id"),
+                reply_markup=get_main_menu()
+            )
             await state.clear()
             return
         
@@ -200,7 +234,14 @@ async def process_channel_id(message: Message, state: FSMContext):
             user_channels[user_id] = []
         
         if any(ch["id"] == chat.id for ch in user_channels[user_id]):
-            await message.answer("⚠️ Kanal allaqachon qo'shilgan!")
+            data = await state.get_data()
+            await edit_or_send_message(
+                message.chat.id,
+                message,
+                "⚠️ Bu kanal/guruh allaqachon qo'shilgan!",
+                message_id=data.get("prompt_message_id"),
+                reply_markup=get_main_menu()
+            )
             await state.clear()
             return
         
@@ -215,13 +256,23 @@ async def process_channel_id(message: Message, state: FSMContext):
         save_data(user_channels)
         write_log(user_id, message.from_user.username, "CHANNEL_ADDED", f"{chat.title}")
         
-        await message.answer(
+        data = await state.get_data()
+        await edit_or_send_message(
+            message.chat.id,
+            message,
             f"✅ <b>Qo'shildi!</b>\n\n📢 {chat.title}\n🆔 <code>{chat.id}</code>",
-            parse_mode="HTML",
+            message_id=data.get("prompt_message_id"),
             reply_markup=get_main_menu()
         )
-    except Exception as e:
-        await message.answer(f"❌ Xatolik: {e}")
+    except Exception:
+        data = await state.get_data()
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            DEFAULT_ERROR_TEXT,
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     await state.clear()
 
 @dp.callback_query(F.data == "my_channels")
@@ -295,9 +346,9 @@ async def delete_channel(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("title_"))
 async def change_title_start(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split("_")[1])
-    await state.update_data(channel_idx=idx)
+    await state.update_data(channel_idx=idx, prompt_message_id=callback.message.message_id)
     await state.set_state(ChannelStates.waiting_for_new_title)
-    await callback.message.answer("✏️ <b>Yangi nom:</b>", parse_mode="HTML")
+    await callback.message.edit_text("✏️ <b>Yangi nomni yuboring:</b>", parse_mode="HTML")
     await callback.answer()
 
 @dp.message(ChannelStates.waiting_for_new_title)
@@ -312,23 +363,28 @@ async def process_new_title(message: Message, state: FSMContext):
         return
     
     channel = user_channels[user_id][idx]
-    lines = message.text.strip().split("\n")
-    if len(lines) < 3:
-        await message.answer("❌ Kamida savol va 2 ta variant!")
-        return
-    
-    question = lines[0]
-    options = [line.strip() for line in lines[1:] if line.strip()]
-    if len(options) < 2:
-        await message.answer("❌ 2 ta variant kerak!")
-        return
-    
+    new_title = message.text.strip()
     try:
-        await bot.send_poll(chat_id=channel["id"], question=question, options=options, is_anonymous=True)
-        write_log(user_id, message.from_user.username, "POLL_SENT", channel['name'])
-        await message.answer(f"✅ <b>Yuborildi!</b>\n\n📢 {channel['name']}", parse_mode="HTML", reply_markup=get_main_menu())
-    except Exception as e:
-        await message.answer(f"❌ {e}")
+        await bot.set_chat_title(chat_id=channel["id"], title=new_title)
+        old_title = channel["name"]
+        user_channels[user_id][idx]["name"] = new_title
+        save_data(user_channels)
+        write_log(user_id, message.from_user.username, "TITLE_CHANGED", f"{old_title} -> {new_title}")
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            f"✅ <b>Nom o'zgartirildi!</b>\n\n📢 Yangi: {new_title}",
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
+    except Exception:
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            DEFAULT_ERROR_TEXT,
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     await state.clear()
 
 # ==================== RASM BOSHQARISH ====================
@@ -342,9 +398,9 @@ async def show_photo_menu(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("setphoto_"))
 async def set_photo_start(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split("_")[1])
-    await state.update_data(channel_idx=idx)
+    await state.update_data(channel_idx=idx, prompt_message_id=callback.message.message_id)
     await state.set_state(ChannelStates.waiting_for_chat_photo)
-    await callback.message.answer("🖼 <b>Rasm yuboring:</b>", parse_mode="HTML")
+    await callback.message.edit_text("🖼 <b>Yangi rasm yuboring:</b>", parse_mode="HTML")
     await callback.answer()
 
 @dp.message(ChannelStates.waiting_for_chat_photo, F.photo)
@@ -362,18 +418,37 @@ async def process_set_photo(message: Message, state: FSMContext):
     try:
         file = await bot.get_file(message.photo[-1].file_id)
         photo_path = f"temp_{user_id}.jpg"
-        await bot.download_file(file.file_path, photo_path)
-        
-        with open(photo_path, 'rb') as photo:
-            await bot.set_chat_photo(chat_id=channel["id"], photo=photo)
-        
-        os.remove(photo_path)
+        # Download to local path
+        try:
+            await bot.download_file(file.file_path, photo_path)
+        except Exception:
+            # aiogram v3 alternative
+            await bot.download(file, destination=photo_path)
+
+        await bot.set_chat_photo(chat_id=channel["id"], photo=FSInputFile(photo_path))
+
+        if os.path.exists(photo_path):
+            os.remove(photo_path)
         write_log(user_id, message.from_user.username, "PHOTO_SET", channel['name'])
-        await message.answer(f"✅ <b>O'rnatildi!</b>\n\n📢 {channel['name']}", parse_mode="HTML", reply_markup=get_main_menu())
-    except Exception as e:
-        await message.answer(f"❌ {e}")
+        data = await state.get_data()
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            f"✅ <b>Rasm o'rnatildi!</b>\n\n📢 {channel['name']}",
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
+    except Exception:
         if os.path.exists(f"temp_{user_id}.jpg"):
             os.remove(f"temp_{user_id}.jpg")
+        data = await state.get_data()
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            DEFAULT_ERROR_TEXT,
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     await state.clear()
 
 @dp.callback_query(F.data.startswith("delphoto_"))
@@ -389,10 +464,10 @@ async def delete_photo(callback: CallbackQuery):
     try:
         await bot.delete_chat_photo(chat_id=channel["id"])
         write_log(user_id, callback.from_user.username, "PHOTO_DELETED", channel['name'])
-        await callback.message.answer(f"✅ <b>O'chirildi!</b>\n\n📢 {channel['name']}", parse_mode="HTML")
+        await callback.message.edit_text(f"✅ <b>Rasm o'chirildi!</b>\n\n📢 {channel['name']}", parse_mode="HTML", reply_markup=get_main_menu())
         await callback.answer("✅")
-    except Exception as e:
-        await callback.answer(f"❌ {e}", show_alert=True)
+    except Exception:
+        await callback.answer("❌ Xatolik", show_alert=True)
 
 # ==================== PIN/UNPIN ====================
 
@@ -405,9 +480,9 @@ async def show_pin_menu(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("dopin_"))
 async def pin_message_start(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split("_")[1])
-    await state.update_data(channel_idx=idx)
+    await state.update_data(channel_idx=idx, prompt_message_id=callback.message.message_id)
     await state.set_state(ChannelStates.waiting_for_pin_message)
-    await callback.message.answer("📌 <b>Xabar ID:</b>", parse_mode="HTML")
+    await callback.message.edit_text("📌 <b>Pin qilinadigan xabar ID'sini yuboring:</b>", parse_mode="HTML")
     await callback.answer()
 
 @dp.message(ChannelStates.waiting_for_pin_message)
@@ -426,11 +501,28 @@ async def process_pin_message(message: Message, state: FSMContext):
         message_id = int(message.text.strip())
         await bot.pin_chat_message(chat_id=channel["id"], message_id=message_id)
         write_log(user_id, message.from_user.username, "PINNED", f"ID: {message_id}")
-        await message.answer(f"✅ <b>Pin qilindi!</b>\n\n📢 {channel['name']}", parse_mode="HTML", reply_markup=get_main_menu())
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            f"✅ <b>Pin qilindi!</b>\n\n📢 {channel['name']}",
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     except ValueError:
-        await message.answer("❌ Faqat raqam!")
-    except Exception as e:
-        await message.answer(f"❌ {e}")
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            "❌ Faqat raqam yuboring!",
+            message_id=data.get("prompt_message_id")
+        )
+    except Exception:
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            DEFAULT_ERROR_TEXT,
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     await state.clear()
 
 @dp.callback_query(F.data.startswith("unpin_"))
@@ -446,10 +538,10 @@ async def unpin_message(callback: CallbackQuery):
     try:
         await bot.unpin_chat_message(chat_id=channel["id"])
         write_log(user_id, callback.from_user.username, "UNPINNED", channel['name'])
-        await callback.message.answer(f"✅ <b>Unpin!</b>\n\n📢 {channel['name']}", parse_mode="HTML")
+        await callback.message.edit_text(f"✅ <b>Unpin bajarildi!</b>\n\n📢 {channel['name']}", parse_mode="HTML", reply_markup=get_main_menu())
         await callback.answer("✅")
-    except Exception as e:
-        await callback.answer(f"❌ {e}", show_alert=True)
+    except Exception:
+        await callback.answer("❌ Xatolik", show_alert=True)
 
 @dp.callback_query(F.data.startswith("unpinall_"))
 async def unpin_all_messages(callback: CallbackQuery):
@@ -464,36 +556,17 @@ async def unpin_all_messages(callback: CallbackQuery):
     try:
         await bot.unpin_all_chat_messages(chat_id=channel["id"])
         write_log(user_id, callback.from_user.username, "UNPINNED_ALL", channel['name'])
-        await callback.message.answer(f"✅ <b>Hammasi unpin!</b>\n\n📢 {channel['name']}", parse_mode="HTML")
+        await callback.message.edit_text(f"✅ <b>Barcha pinlar olib tashlandi!</b>\n\n📢 {channel['name']}", parse_mode="HTML", reply_markup=get_main_menu())
         await callback.answer("✅")
-    except Exception as e:
-        await callback.answer(f"❌ {e}", show_alert=True)
-    
-    if user_id not in user_channels or idx >= len(user_channels[user_id]):
-        await message.answer("❌ Topilmadi!")
-        await state.clear()
-        return
-    
-    channel = user_channels[user_id][idx]
-    new_title = message.text.strip()
-    
-    try:
-        await bot.set_chat_title(chat_id=channel["id"], title=new_title)
-        old_title = channel["name"]
-        user_channels[user_id][idx]["name"] = new_title
-        save_data(user_channels)
-        write_log(user_id, message.from_user.username, "TITLE_CHANGED", f"{old_title} -> {new_title}")
-        await message.answer(f"✅ <b>O'zgartirildi!</b>\n\n📢 Yangi: {new_title}", parse_mode="HTML", reply_markup=get_main_menu())
-    except Exception as e:
-        await message.answer(f"❌ {e}")
-    await state.clear()
+    except Exception:
+        await callback.answer("❌ Xatolik", show_alert=True)
 
 @dp.callback_query(F.data.startswith("desc_"))
 async def change_desc_start(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split("_")[1])
-    await state.update_data(channel_idx=idx)
+    await state.update_data(channel_idx=idx, prompt_message_id=callback.message.message_id)
     await state.set_state(ChannelStates.waiting_for_new_description)
-    await callback.message.answer("📝 <b>Yangi tavsif:</b>", parse_mode="HTML")
+    await callback.message.edit_text("📝 <b>Yangi tavsifni yuboring:</b>", parse_mode="HTML")
     await callback.answer()
 
 @dp.message(ChannelStates.waiting_for_new_description)
@@ -511,9 +584,21 @@ async def process_new_description(message: Message, state: FSMContext):
     try:
         await bot.set_chat_description(chat_id=channel["id"], description=message.text.strip())
         write_log(user_id, message.from_user.username, "DESC_CHANGED", channel['name'])
-        await message.answer(f"✅ <b>Tavsif o'zgartirildi!</b>\n\n📢 {channel['name']}", parse_mode="HTML", reply_markup=get_main_menu())
-    except Exception as e:
-        await message.answer(f"❌ {e}")
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            f"✅ <b>Tavsif o'zgartirildi!</b>\n\n📢 {channel['name']}",
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
+    except Exception:
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            DEFAULT_ERROR_TEXT,
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     await state.clear()
 
 # ==================== MA'LUMOT ====================
@@ -536,11 +621,17 @@ async def get_chat_info(callback: CallbackQuery):
     channel = user_channels[user_id][idx]
     try:
         chat = await bot.get_chat(chat_id=channel["id"])
-        info = f"📊 <b>Ma'lumot:</b>\n\n🆔 <code>{chat.id}</code>\n📝 {chat.title}\n📖 {chat.description or 'Yo`q'}\n👤 @{chat.username or 'Yo`q'}"
-        await callback.message.answer(info, parse_mode="HTML")
+        info = (
+            "📊 <b>Ma'lumot:</b>\n\n"
+            f"🆔 <code>{chat.id}</code>\n"
+            f"📝 {chat.title}\n"
+            f"📖 {chat.description or 'Yo\`q'}\n"
+            f"👤 @{chat.username or 'Yo\`q'}"
+        )
+        await callback.message.edit_text(info, parse_mode="HTML", reply_markup=get_info_menu(idx))
         await callback.answer("✅")
-    except Exception as e:
-        await callback.answer(f"❌ {e}", show_alert=True)
+    except Exception:
+        await callback.answer("❌ Xatolik", show_alert=True)
 
 @dp.callback_query(F.data.startswith("getadmins_"))
 async def get_admins(callback: CallbackQuery):
@@ -556,13 +647,13 @@ async def get_admins(callback: CallbackQuery):
         admins = await bot.get_chat_administrators(chat_id=channel["id"])
         admin_list = "👥 <b>Adminlar:</b>\n\n"
         for admin in admins:
-            status = "🔴" if admin.status == "creator" else "🟢"
+            status = "👑" if getattr(admin, 'status', '') == "creator" else "🛡"
             username = f"@{admin.user.username}" if admin.user.username else "Yo'q"
             admin_list += f"{status} {admin.user.full_name} ({username})\n"
-        await callback.message.answer(admin_list, parse_mode="HTML")
+        await callback.message.edit_text(admin_list, parse_mode="HTML", reply_markup=get_info_menu(idx))
         await callback.answer("✅")
-    except Exception as e:
-        await callback.answer(f"❌ {e}", show_alert=True)
+    except Exception:
+        await callback.answer("❌ Xatolik", show_alert=True)
 
 @dp.callback_query(F.data.startswith("getcount_"))
 async def get_member_count(callback: CallbackQuery):
@@ -576,10 +667,10 @@ async def get_member_count(callback: CallbackQuery):
     channel = user_channels[user_id][idx]
     try:
         count = await bot.get_chat_member_count(chat_id=channel["id"])
-        await callback.message.answer(f"👥 <b>A'zolar:</b> {count:,}", parse_mode="HTML")
+        await callback.message.edit_text(f"👥 <b>A'zolar:</b> {count:,}", parse_mode="HTML", reply_markup=get_info_menu(idx))
         await callback.answer("✅")
-    except Exception as e:
-        await callback.answer(f"❌ {e}", show_alert=True)
+    except Exception:
+        await callback.answer("❌ Xatolik", show_alert=True)
 
 # ==================== XABAR YUBORISH ====================
 
@@ -592,9 +683,9 @@ async def show_send_menu_handler(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("sendtext_"))
 async def send_text_start(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split("_")[1])
-    await state.update_data(channel_idx=idx)
+    await state.update_data(channel_idx=idx, prompt_message_id=callback.message.message_id)
     await state.set_state(ChannelStates.waiting_for_message)
-    await callback.message.answer("💬 <b>Matn yuboring:</b>", parse_mode="HTML")
+    await callback.message.edit_text("💬 <b>Yuboriladigan matnni yuboring:</b>", parse_mode="HTML")
     await callback.answer()
 
 @dp.message(ChannelStates.waiting_for_message)
@@ -612,17 +703,29 @@ async def process_send_message(message: Message, state: FSMContext):
     try:
         await bot.send_message(chat_id=channel["id"], text=message.text, parse_mode="HTML")
         write_log(user_id, message.from_user.username, "MESSAGE_SENT", channel['name'])
-        await message.answer(f"✅ <b>Yuborildi!</b>\n\n📢 {channel['name']}", parse_mode="HTML", reply_markup=get_main_menu())
-    except Exception as e:
-        await message.answer(f"❌ {e}")
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            f"✅ <b>Yuborildi!</b>\n\n📢 {channel['name']}",
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
+    except Exception:
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            DEFAULT_ERROR_TEXT,
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     await state.clear()
 
 @dp.callback_query(F.data.startswith("sendphoto_"))
 async def send_photo_start(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split("_")[1])
-    await state.update_data(channel_idx=idx)
+    await state.update_data(channel_idx=idx, prompt_message_id=callback.message.message_id)
     await state.set_state(ChannelStates.waiting_for_photo)
-    await callback.message.answer("📸 <b>Rasm yuboring:</b>", parse_mode="HTML")
+    await callback.message.edit_text("📸 <b>Rasm yuboring (caption ixtiyoriy):</b>", parse_mode="HTML")
     await callback.answer()
 
 @dp.message(ChannelStates.waiting_for_photo, F.photo)
@@ -640,17 +743,29 @@ async def process_send_photo(message: Message, state: FSMContext):
     try:
         await bot.send_photo(chat_id=channel["id"], photo=message.photo[-1].file_id, caption=message.caption, parse_mode="HTML")
         write_log(user_id, message.from_user.username, "PHOTO_SENT", channel['name'])
-        await message.answer(f"✅ <b>Yuborildi!</b>\n\n📢 {channel['name']}", parse_mode="HTML", reply_markup=get_main_menu())
-    except Exception as e:
-        await message.answer(f"❌ {e}")
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            f"✅ <b>Rasm yuborildi!</b>\n\n📢 {channel['name']}",
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
+    except Exception:
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            DEFAULT_ERROR_TEXT,
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     await state.clear()
 
 @dp.callback_query(F.data.startswith("sendmedia_"))
 async def send_media_group_start(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split("_")[1])
-    await state.update_data(channel_idx=idx, media_list=[])
+    await state.update_data(channel_idx=idx, media_list=[], prompt_message_id=callback.message.message_id)
     await state.set_state(ChannelStates.waiting_for_media_group)
-    await callback.message.answer("🖼 <b>Rasmlarni yuboring (2-10 ta)</b>\n\n/done - Yuborish", parse_mode="HTML")
+    await callback.message.edit_text("🖼 <b>Rasmlarni yuboring (2-10 ta)</b>\n\n/done - Yuborish", parse_mode="HTML")
     await callback.answer()
 
 @dp.message(ChannelStates.waiting_for_media_group, F.photo)
@@ -659,7 +774,6 @@ async def collect_media(message: Message, state: FSMContext):
     media_list = data.get("media_list", [])
     media_list.append({"file_id": message.photo[-1].file_id, "caption": message.caption})
     await state.update_data(media_list=media_list)
-    await message.answer(f"✅ Qo'shildi: {len(media_list)} ta\n\n/done - Yuborish")
 
 @dp.message(ChannelStates.waiting_for_media_group, Command("done"))
 async def send_media_group(message: Message, state: FSMContext):
@@ -685,20 +799,32 @@ async def send_media_group(message: Message, state: FSMContext):
                 media_group.append(InputMediaPhoto(media=media["file_id"], caption=media["caption"]))
             else:
                 media_group.append(InputMediaPhoto(media=media["file_id"]))
-        
+
         await bot.send_media_group(chat_id=channel["id"], media=media_group)
         write_log(user_id, message.from_user.username, "MEDIA_SENT", f"{len(media_list)} photos")
-        await message.answer(f"✅ <b>Yuborildi!</b>\n\n📢 {channel['name']}\n🖼 {len(media_list)} ta", parse_mode="HTML", reply_markup=get_main_menu())
-    except Exception as e:
-        await message.answer(f"❌ {e}")
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            f"✅ <b>Yuborildi!</b>\n\n📢 {channel['name']}\n🖼 {len(media_list)} ta",
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
+    except Exception:
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            DEFAULT_ERROR_TEXT,
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     await state.clear()
 
 @dp.callback_query(F.data.startswith("sendpoll_"))
 async def send_poll_start(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split("_")[1])
-    await state.update_data(channel_idx=idx)
+    await state.update_data(channel_idx=idx, prompt_message_id=callback.message.message_id)
     await state.set_state(ChannelStates.waiting_for_poll)
-    await callback.message.answer("📊 <b>So'rovnoma:</b>\n\nSavol\nVariant 1\nVariant 2", parse_mode="HTML")
+    await callback.message.edit_text("📊 <b>So'rovnoma yuboring</b>:\n\nSavol\nVariant 1\nVariant 2", parse_mode="HTML")
     await callback.answer()
 
 @dp.message(ChannelStates.waiting_for_poll)
@@ -706,7 +832,49 @@ async def process_send_poll(message: Message, state: FSMContext):
     data = await state.get_data()
     idx = data.get("channel_idx")
     user_id = message.from_user.id
-
+    if user_id not in user_channels or idx is None or idx >= len(user_channels[user_id]):
+        await state.clear()
+        await message.answer("❌ Topilmadi!")
+        return
+    channel = user_channels[user_id][idx]
+    lines = message.text.strip().split("\n")
+    if len(lines) < 3:
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            "❌ Kamida savol va 2 ta variant yuboring!",
+            message_id=data.get("prompt_message_id")
+        )
+        return
+    question = lines[0]
+    options = [line.strip() for line in lines[1:] if line.strip()]
+    if len(options) < 2:
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            "❌ Kamida 2 ta variant kerak!",
+            message_id=data.get("prompt_message_id")
+        )
+        return
+    try:
+        await bot.send_poll(chat_id=channel["id"], question=question, options=options, is_anonymous=True)
+        write_log(user_id, message.from_user.username, "POLL_SENT", channel['name'])
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            f"✅ <b>So'rovnoma yuborildi!</b>\n\n📢 {channel['name']}",
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
+    except Exception:
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            DEFAULT_ERROR_TEXT,
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
+    await state.clear()
 
 # ==================== A'ZOLAR BOSHQARUVI ====================
 
@@ -719,9 +887,9 @@ async def show_members_menu_handler(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("ban_"))
 async def ban_user_start(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split("_")[1])
-    await state.update_data(channel_idx=idx)
+    await state.update_data(channel_idx=idx, prompt_message_id=callback.message.message_id)
     await state.set_state(ChannelStates.waiting_for_ban_user)
-    await callback.message.answer("🚫 <b>User ID:</b>", parse_mode="HTML")
+    await callback.message.edit_text("🚫 <b>Ban uchun User ID yuboring:</b>", parse_mode="HTML")
     await callback.answer()
 
 @dp.message(ChannelStates.waiting_for_ban_user)
@@ -740,19 +908,36 @@ async def process_ban_user(message: Message, state: FSMContext):
         ban_user_id = int(message.text.strip())
         await bot.ban_chat_member(chat_id=channel["id"], user_id=ban_user_id)
         write_log(user_id, message.from_user.username, "BANNED", f"User: {ban_user_id}")
-        await message.answer(f"✅ <b>Ban!</b>\n\n📢 {channel['name']}\n👤 {ban_user_id}", parse_mode="HTML", reply_markup=get_main_menu())
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            f"✅ <b>Ban qilindi!</b>\n\n📢 {channel['name']}\n👤 {ban_user_id}",
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     except ValueError:
-        await message.answer("❌ Faqat raqam!")
-    except Exception as e:
-        await message.answer(f"❌ {e}")
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            "❌ Faqat raqam yuboring!",
+            message_id=data.get("prompt_message_id")
+        )
+    except Exception:
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            DEFAULT_ERROR_TEXT,
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     await state.clear()
 
 @dp.callback_query(F.data.startswith("unban_"))
 async def unban_user_start(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split("_")[1])
-    await state.update_data(channel_idx=idx)
+    await state.update_data(channel_idx=idx, prompt_message_id=callback.message.message_id)
     await state.set_state(ChannelStates.waiting_for_unban_user)
-    await callback.message.answer("✅ <b>User ID:</b>", parse_mode="HTML")
+    await callback.message.edit_text("✅ <b>Unban uchun User ID yuboring:</b>", parse_mode="HTML")
     await callback.answer()
 
 @dp.message(ChannelStates.waiting_for_unban_user)
@@ -771,19 +956,36 @@ async def process_unban_user(message: Message, state: FSMContext):
         unban_user_id = int(message.text.strip())
         await bot.unban_chat_member(chat_id=channel["id"], user_id=unban_user_id)
         write_log(user_id, message.from_user.username, "UNBANNED", f"User: {unban_user_id}")
-        await message.answer(f"✅ <b>Unban!</b>\n\n📢 {channel['name']}\n👤 {unban_user_id}", parse_mode="HTML", reply_markup=get_main_menu())
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            f"✅ <b>Unban qilindi!</b>\n\n📢 {channel['name']}\n👤 {unban_user_id}",
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     except ValueError:
-        await message.answer("❌ Faqat raqam!")
-    except Exception as e:
-        await message.answer(f"❌ {e}")
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            "❌ Faqat raqam yuboring!",
+            message_id=data.get("prompt_message_id")
+        )
+    except Exception:
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            DEFAULT_ERROR_TEXT,
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     await state.clear()
 
 @dp.callback_query(F.data.startswith("restrict_"))
 async def restrict_user_start(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split("_")[1])
-    await state.update_data(channel_idx=idx)
+    await state.update_data(channel_idx=idx, prompt_message_id=callback.message.message_id)
     await state.set_state(ChannelStates.waiting_for_restrict_user)
-    await callback.message.answer("⚠️ <b>User ID:</b>", parse_mode="HTML")
+    await callback.message.edit_text("⚠️ <b>Restrict uchun User ID yuboring:</b>", parse_mode="HTML")
     await callback.answer()
 
 @dp.message(ChannelStates.waiting_for_restrict_user)
@@ -800,22 +1002,45 @@ async def process_restrict_user(message: Message, state: FSMContext):
     channel = user_channels[user_id][idx]
     try:
         restrict_user_id = int(message.text.strip())
-        permissions = ChatPermissions(can_send_messages=False, can_send_media_messages=False, can_send_polls=False, can_send_other_messages=False)
-        await bot.restrict_chat_member(chat_id=channel["id"], user_id=restrict_user_id, permissions=permissions, until_date=datetime.now() + timedelta(days=365))
+        permissions = ChatPermissions(
+            can_send_messages=False,
+            can_send_media_messages=False,
+            can_send_polls=False,
+            can_send_other_messages=False
+        )
+        until_ts = int((datetime.now() + timedelta(days=365)).timestamp())
+        await bot.restrict_chat_member(chat_id=channel["id"], user_id=restrict_user_id, permissions=permissions, until_date=until_ts)
         write_log(user_id, message.from_user.username, "RESTRICTED", f"User: {restrict_user_id}")
-        await message.answer(f"✅ <b>Restrict!</b>\n\n📢 {channel['name']}\n👤 {restrict_user_id}", parse_mode="HTML", reply_markup=get_main_menu())
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            f"✅ <b>Restrict qilindi!</b>\n\n📢 {channel['name']}\n👤 {restrict_user_id}",
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     except ValueError:
-        await message.answer("❌ Faqat raqam!")
-    except Exception as e:
-        await message.answer(f"❌ {e}")
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            "❌ Faqat raqam yuboring!",
+            message_id=data.get("prompt_message_id")
+        )
+    except Exception:
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            DEFAULT_ERROR_TEXT,
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     await state.clear()
 
 @dp.callback_query(F.data.startswith("promote_"))
 async def promote_user_start(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split("_")[1])
-    await state.update_data(channel_idx=idx)
+    await state.update_data(channel_idx=idx, prompt_message_id=callback.message.message_id)
     await state.set_state(ChannelStates.waiting_for_promote_user)
-    await callback.message.answer("⭐️ <b>User ID:</b>", parse_mode="HTML")
+    await callback.message.edit_text("⭐️ <b>Admin qilish uchun User ID yuboring:</b>", parse_mode="HTML")
     await callback.answer()
 
 @dp.message(ChannelStates.waiting_for_promote_user)
@@ -840,11 +1065,28 @@ async def process_promote_user(message: Message, state: FSMContext):
             can_change_info=True, can_invite_users=True, can_pin_messages=True
         )
         write_log(user_id, message.from_user.username, "PROMOTED", f"User: {promote_user_id}")
-        await message.answer(f"✅ <b>Admin!</b>\n\n📢 {channel['name']}\n👤 {promote_user_id}", parse_mode="HTML", reply_markup=get_main_menu())
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            f"✅ <b>Admin qilib qo'yildi!</b>\n\n📢 {channel['name']}\n👤 {promote_user_id}",
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     except ValueError:
-        await message.answer("❌ Faqat raqam!")
-    except Exception as e:
-        await message.answer(f"❌ {e}")
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            "❌ Faqat raqam yuboring!",
+            message_id=data.get("prompt_message_id")
+        )
+    except Exception:
+        await edit_or_send_message(
+            message.chat.id,
+            message,
+            DEFAULT_ERROR_TEXT,
+            message_id=data.get("prompt_message_id"),
+            reply_markup=get_main_menu()
+        )
     await state.clear()
 
 # ==================== HAVOLALAR ====================
@@ -862,10 +1104,10 @@ async def export_invite_link(callback: CallbackQuery):
     try:
         link = await bot.export_chat_invite_link(chat_id=channel["id"])
         write_log(user_id, callback.from_user.username, "LINK_EXPORTED", channel['name'])
-        await callback.message.answer(f"🔗 <b>Havola:</b>\n\n📢 {channel['name']}\n🔗 {link}", parse_mode="HTML")
+        await callback.message.edit_text(f"🔗 <b>Doimiy havola:</b>\n\n📢 {channel['name']}\n🔗 {link}", parse_mode="HTML", reply_markup=get_links_menu(idx))
         await callback.answer("✅")
-    except Exception as e:
-        await callback.answer(f"❌ {e}", show_alert=True)
+    except Exception:
+        await callback.answer("❌ Xatolik", show_alert=True)
 
 @dp.callback_query(F.data.startswith("createlink_"))
 async def create_invite_link(callback: CallbackQuery):
@@ -878,12 +1120,17 @@ async def create_invite_link(callback: CallbackQuery):
     
     channel = user_channels[user_id][idx]
     try:
-        link = await bot.create_chat_invite_link(chat_id=channel["id"], expire_date=datetime.now() + timedelta(days=1), member_limit=100)
+        expire_ts = int((datetime.now() + timedelta(days=1)).timestamp())
+        link = await bot.create_chat_invite_link(chat_id=channel["id"], expire_date=expire_ts, member_limit=100)
         write_log(user_id, callback.from_user.username, "LINK_CREATED", channel['name'])
-        await callback.message.answer(f"⏰ <b>Cheklangan:</b>\n\n📢 {channel['name']}\n🔗 {link.invite_link}\n\n⏰ 24h | 👥 100", parse_mode="HTML")
+        await callback.message.edit_text(
+            f"⏰ <b>Cheklangan havola:</b>\n\n📢 {channel['name']}\n🔗 {link.invite_link}\n\n⏰ 24 soat | 👥 100",
+            parse_mode="HTML",
+            reply_markup=get_links_menu(idx)
+        )
         await callback.answer("✅")
-    except Exception as e:
-        await callback.answer(f"❌ {e}", show_alert=True)
+    except Exception:
+        await callback.answer("❌ Xatolik", show_alert=True)
 
 # ==================== NAVIGATSIYA ====================
 
@@ -936,8 +1183,8 @@ async def send_logs(message: Message):
             await message.answer_document(FSInputFile(LOG_FILE), caption="📋 <b>Logs</b>", parse_mode="HTML")
         else:
             await message.answer("❌ Yo'q")
-    except Exception as e:
-        await message.answer(f"❌ {e}")
+    except Exception:
+        await message.answer(DEFAULT_ERROR_TEXT)
 
 @dp.message(Command("backup"))
 async def send_backup(message: Message):
@@ -948,8 +1195,8 @@ async def send_backup(message: Message):
             await message.answer_document(FSInputFile(DATA_FILE), caption="💾 <b>Backup</b>", parse_mode="HTML")
         else:
             await message.answer("❌ Yo'q")
-    except Exception as e:
-        await message.answer(f"❌ {e}")
+    except Exception:
+        await message.answer(DEFAULT_ERROR_TEXT)
 
 @dp.message(Command("help"))
 async def help_handler(message: Message):
@@ -1001,5 +1248,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n⚠️ Ctrl+C")
-    except Exception as e:
-        print(f"\n❌ {e}")
+    except Exception:
+        print("\n❌ Xatolik")
